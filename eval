@@ -1,0 +1,358 @@
+"""
+eval.py - Evaluation script for Physics-Incorporated 3D Range-Gated Imaging
+"""
+
+import os
+import glob
+import argparse
+
+import cv2
+import numpy as np
+import torch
+import torch.nn as nn
+import tifffile
+import matplotlib as mpl
+import matplotlib.cm as cm
+from torchvision import transforms
+from torchvision.transforms import Compose
+
+from dpt.models import DPTDepthModel
+from dpt.transforms import Resize, NormalizeImage, PrepareForNet
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# ────────────────────────────────────────────────
+# Data Loading
+# ────────────────────────────────────────────────
+
+def read_image_paths_from_file(file_path):
+    """Read image IDs from a text file. Commas are replaced with underscores."""
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            return [
+                line.strip().replace(",", "_")
+                for line in f
+                if line.strip()
+            ]
+    except FileNotFoundError:
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+
+def read_gated_image(base_dir, img_id, num_bits=10):
+    """Load and normalize a 3-channel gated image."""
+    normalizer = 2 ** num_bits - 1.0
+    gated_imgs = []
+    for gate_id in range(3):
+        gate_dir = os.path.join(base_dir, f"gated{gate_id}_10bit")
+        img = cv2.imread(
+            os.path.join(gate_dir, img_id + ".png"),
+            cv2.IMREAD_ANYCOLOR | cv2.IMREAD_ANYDEPTH,
+        )
+        img = img.copy()
+        img[img > 2 ** 10 - 1] = normalizer
+        img = np.float32(img / normalizer)
+        gated_imgs.append(np.expand_dims(img, axis=2))
+    return np.concatenate(gated_imgs, axis=2)
+
+
+def read_lidar_depth(dror_path, img_id):
+    """Load LiDAR ground-truth depth and valid mask, cropped to 420×980."""
+    H, W = 420, 980
+    oh = (720 - H) // 2
+    ow = (1280 - W) // 2
+
+    depth_gt = np.load(os.path.join(dror_path, img_id + ".npz"))["arr_0"]
+    gt_mask = depth_gt > 0.0
+
+    depth_gt = np.float32(depth_gt)[oh:oh + H, ow:ow + W]
+    gt_mask  = gt_mask[oh:oh + H, ow:ow + W]
+
+    # Add batch and channel dims: (1, 1, H, W)
+    depth_gt = torch.from_numpy(depth_gt[np.newaxis, np.newaxis])
+    gt_mask  = torch.from_numpy(gt_mask[np.newaxis, np.newaxis])
+    return depth_gt, gt_mask
+
+
+def read_prior_depth(prior_path, img_id):
+    """Load denoised prior depth map and return as a normalized tensor."""
+    H, W = 420, 980
+    oh = (512 - H) // 2
+    ow = (1024 - W) // 2
+
+    prior = np.load(os.path.join(prior_path, img_id + ".npz"))["arr_0"]
+    prior = np.float32(prior)[oh:oh + H, ow:ow + W]
+
+    # Normalize to [−1, 1] via /180 then channel-wise normalization
+    prior = prior / 180.0
+    prior_tensor = torch.from_numpy(prior[np.newaxis, np.newaxis])  # (1,1,H,W)
+    normalize = transforms.Normalize(mean=[0.5], std=[0.5])
+    return normalize(prior_tensor.squeeze(0)).unsqueeze(0)           # (1,1,H,W)
+
+
+# ────────────────────────────────────────────────
+# Visualization
+# ────────────────────────────────────────────────
+
+def colorize_depth(depth, min_dist=3, max_dist=80):
+    """Map a depth array to a jet-colorized uint8 image."""
+    depth = depth[0, 0]
+    norm = mpl.colors.Normalize(vmin=min_dist, vmax=max_dist)
+    m    = cm.ScalarMappable(norm=norm, cmap=cm.jet)
+    color = (255 * m.to_rgba(depth)[:, :, :3]).astype(np.uint8)
+    color[depth <= 0]        = 0
+    color[np.isnan(depth)]   = 0
+    color[depth == np.inf]   = 0
+    return color
+
+
+# ────────────────────────────────────────────────
+# Metrics
+# ────────────────────────────────────────────────
+
+class RunningAverage:
+    def __init__(self):
+        self.avg, self.count = 0.0, 0
+
+    def append(self, value):
+        self.avg = (value + self.count * self.avg) / (self.count + 1)
+        self.count += 1
+
+    def get_value(self):
+        return self.avg
+
+
+class RunningAverageDict:
+    def __init__(self):
+        self._dict = None
+
+    def update(self, new_dict):
+        if self._dict is None:
+            self._dict = {k: RunningAverage() for k in new_dict}
+        for k, v in new_dict.items():
+            self._dict[k].append(v)
+
+    def get_value(self):
+        return {k: v.get_value() for k, v in self._dict.items()}
+
+
+def compute_errors(depth_gt, depth_pred, min_depth=3.0, max_depth=80.0):
+    """
+    Compute standard depth-estimation metrics.
+
+    Args:
+        depth_gt   (Tensor): ground-truth depth  (1, 1, H, W)
+        depth_pred (Tensor): predicted depth      (1, 1, H, W)
+
+    Returns:
+        dict with keys: rmse, mae, ard, a1, a2, a3,
+                        abs_rel, sq_rel, log_10, rmse_log, silog
+        or None if no valid pixels exist.
+    """
+    pred = nn.functional.interpolate(
+        depth_pred, depth_gt.shape[-2:], mode="bilinear", align_corners=True
+    )
+    pred = pred.squeeze().cpu().numpy()
+    gt   = depth_gt.squeeze().cpu().numpy()
+
+    pred = np.clip(pred, min_depth, max_depth)
+    pred[np.isinf(pred)]  = max_depth
+    pred[np.isnan(pred)]  = min_depth
+
+    valid = np.logical_and(gt > min_depth, gt < max_depth)
+    if valid.sum() == 0:
+        return None
+
+    gt, pred = gt[valid], pred[valid]
+
+    thresh   = np.maximum(gt / pred, pred / gt)
+    a1       = (thresh < 1.25      ).mean()
+    a2       = (thresh < 1.25 ** 2 ).mean()
+    a3       = (thresh < 1.25 ** 3 ).mean()
+
+    abs_rel  = np.mean(np.abs(gt - pred) / gt)
+    sq_rel   = np.mean(((gt - pred) ** 2) / gt)
+    rmse     = np.sqrt(np.mean((gt - pred) ** 2))
+    mae      = np.mean(np.abs(gt - pred))
+    ard      = np.mean(np.abs(pred - gt) / gt, dtype=np.float32)
+    log_10   = np.mean(np.abs(np.log10(gt) - np.log10(pred)))
+
+    err      = np.log(pred) - np.log(gt)
+    rmse_log = np.sqrt(np.mean(err ** 2))
+    silog    = np.sqrt(max(0.0, np.mean(err ** 2) - np.mean(err) ** 2)) * 100
+
+    return dict(
+        rmse=rmse, mae=mae, ard=ard,
+        a1=a1, a2=a2, a3=a3,
+        abs_rel=abs_rel, sq_rel=sq_rel,
+        log_10=log_10, rmse_log=rmse_log, silog=silog,
+    )
+
+
+# ────────────────────────────────────────────────
+# Model Loading
+# ────────────────────────────────────────────────
+
+def build_model(model_type, model_path):
+    """Instantiate and return the depth model."""
+    configs = {
+        "dpt_hybrid": dict(
+            backbone="vitb_rn50_384",
+            scale=0.000040402, shift=0.01, invert=True,
+        ),
+        "dpt_large": dict(
+            backbone="vitl16_384",
+        ),
+        "dpt_hybrid_kitti": dict(
+            backbone="vitb_rn50_384",
+            scale=0.000040402, shift=0.01, invert=True,
+        ),
+        "dpt_hybrid_nyu": dict(
+            backbone="vitb_rn50_384",
+            scale=0.000305, shift=0.1378, invert=True,
+        ),
+    }
+    if model_type not in configs:
+        raise ValueError(
+            f"Unknown model_type '{model_type}'. "
+            "Choose from: " + ", ".join(configs)
+        )
+    cfg = configs[model_type]
+    model = DPTDepthModel(
+        path=model_path,
+        non_negative=True,
+        enable_attention_hooks=False,
+        **cfg,
+    )
+    return model
+
+
+def build_transforms(net_w=384, net_h=384):
+    normalization = NormalizeImage(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+    resize_kwargs = dict(
+        resize_target=None,
+        keep_aspect_ratio=False,
+        ensure_multiple_of=384,
+        resize_method="minimal",
+        image_interpolation_method=cv2.INTER_LANCZOS4,
+    )
+    transform = Compose([Resize(net_w, net_h, **resize_kwargs), normalization, PrepareForNet()])
+    resizer   = Compose([Resize(net_w, net_h, **resize_kwargs)])
+    return transform, resizer
+
+
+# ────────────────────────────────────────────────
+# Main Evaluation Loop
+# ────────────────────────────────────────────────
+
+def run(args):
+    print(f"Device: {device}")
+
+    # ── Model ──────────────────────────────────
+    model = build_model(args.model_type, args.model_weights)
+    model.eval()
+    if args.optimize and device.type == "cuda":
+        model = model.to(memory_format=torch.channels_last).half()
+    model.to(device)
+
+    transform, resizer = build_transforms()
+    normalize_prior    = transforms.Normalize(mean=[0.5], std=[0.5])
+
+    # ── Image list ─────────────────────────────
+    img_names  = read_image_paths_from_file(args.file_text)
+    num_images = len(img_names)
+    os.makedirs(args.output_path, exist_ok=True)
+    os.makedirs(args.tiff_path,   exist_ok=True)
+
+    metrics = RunningAverageDict()
+
+    print(f"Start processing {num_images} images …\n")
+    for idx, img_name in enumerate(img_names):
+        print(f"  [{idx + 1}/{num_images}] {img_name}")
+
+        # ── Load inputs ────────────────────────
+        img         = read_gated_image(args.input_path, img_name)        # H×W×3
+        lidar, mask = read_lidar_depth(args.dror_path,  img_name)
+
+        # Crop gated image to 420×980
+        H, W = 420, 980
+        oh = (img.shape[0] - H) // 2
+        ow = (img.shape[1] - W) // 2
+        img = img[oh:oh + H, ow:ow + W]
+
+        # Prior depth
+        prior_np = np.load(os.path.join(args.prior_path, img_name + ".npz"))["arr_0"]
+        oh_p = (512 - H) // 2
+        ow_p = (1024 - W) // 2
+        prior_np = np.float32(prior_np)[oh_p:oh_p + H, ow_p:ow_p + W] / 180.0
+        prior_np = np.expand_dims(prior_np, axis=2)
+        prior_rs = resizer({"image": prior_np})["image"]
+        prior_t  = normalize_prior(torch.from_numpy(prior_rs).unsqueeze(0)).unsqueeze(0).to(device)
+
+        # ── Inference ──────────────────────────
+        img_input = transform({"image": img})["image"]
+        with torch.no_grad():
+            sample = torch.from_numpy(img_input).unsqueeze(0).float().to(device)
+            if args.optimize and device.type == "cuda":
+                sample = sample.to(memory_format=torch.channels_last).half()
+            model  = model.float()
+            sample = sample.float()
+
+            pred = model.forward(sample, prior_t)
+            pred = nn.functional.interpolate(
+                pred.unsqueeze(1), size=img.shape[:2],
+                mode="bicubic", align_corners=False,
+            )                                           # (1, 1, H, W)
+
+        # ── Save outputs ───────────────────────
+        pred_np = pred.squeeze().cpu().numpy()
+
+        color_img = colorize_depth(pred.cpu().numpy()[np.newaxis], 3, 80)
+        cv2.imwrite(os.path.join(args.output_path, f"{img_name}.jpg"), color_img)
+
+        tiff_path = os.path.join(args.tiff_path, f"{img_name}.tiff")
+        tifffile.imwrite(tiff_path, pred_np)
+
+        # ── Metrics ────────────────────────────
+        err = compute_errors(lidar, pred.cpu())
+        if err is not None and not any(np.isnan(v) for v in err.values()):
+            metrics.update(err)
+            print(f"    metrics: {err}")
+
+    print("\n=== Final Average Metrics ===")
+    for k, v in metrics.get_value().items():
+        print(f"  {k:10s}: {v:.4f}")
+
+
+# ────────────────────────────────────────────────
+# Entry Point
+# ────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Evaluate PI-3DRGI depth estimation model."
+    )
+    parser.add_argument("-i", "--input_path",   required=True,
+                        help="Root folder of gated images (contains gated0_10bit/, …)")
+    parser.add_argument("--dror_path",          required=True,
+                        help="Folder with LiDAR ground-truth .npz files")
+    parser.add_argument("--prior_path",         required=True,
+                        help="Folder with denoised prior depth .npz files")
+    parser.add_argument("-o", "--output_path",  default="output/color",
+                        help="Folder for colorized depth images (default: output/color)")
+    parser.add_argument("--tiff_path",          default="output/tiff",
+                        help="Folder for raw depth TIFF files (default: output/tiff)")
+    parser.add_argument("--file_text",          required=True,
+                        help="Text file listing image IDs to evaluate")
+    parser.add_argument("-m", "--model_weights", required=True,
+                        help="Path to model weight file (.pt)")
+    parser.add_argument("-t", "--model_type",   default="dpt_hybrid",
+                        choices=["dpt_large", "dpt_hybrid",
+                                 "dpt_hybrid_kitti", "dpt_hybrid_nyu"],
+                        help="Model architecture (default: dpt_hybrid)")
+    parser.add_argument("--optimize", action="store_true", default=True,
+                        help="Use half-precision on CUDA (default: True)")
+    parser.add_argument("--no-optimize", dest="optimize", action="store_false")
+
+    args = parser.parse_args()
+    run(args)
